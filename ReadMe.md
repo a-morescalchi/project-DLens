@@ -8,15 +8,13 @@ Code inspired by https://github.com/CompVis/latent-diffusion
 
 
 
+# Istruzioni
 
-# Requirements
+Saricare le repo 
 
-torch 
+git clone git@github.com:CompVis/latent-diffusion.git
+git clone git@github.com:a-morescalchi/project-DLens.git
 
-(A seconda di quanto usiamo l'altra repo: einops)
+Caricare su drive latent diffusion, inserire lorapy, lora_train.py, lora_train_dataset.py all'interno di latent_diffusion
 
-
-
-# File Descriptions
-
-- **lora.py**: WIP implementation of a low rank adapter. Not yet working, and only for attention layers. Modeled on ldm/modules/attention.py from the original repo
+Far girare desperados.ipynb su colab

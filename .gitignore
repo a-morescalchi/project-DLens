@@ -1,7 +1,12 @@
 #virtual environment
 venv
 
+#l'altra repo
+latent-diffusion*
+lora_old*
+deepfake*
 
 
 #wip files
 vera.py 
+latent-diffusion/
