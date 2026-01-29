@@ -1,3 +1,4 @@
+from xml.parsers.expat import model
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -60,7 +61,7 @@ def load_model(config_path, ckpt_path):
     model.eval()
     return model
 
-def train():
+def train(BATCH_SIZE = 4, LR = 1e-4, EPOCHS = 100):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     # 1. Load the Freeze the Base Model
@@ -70,8 +71,8 @@ def train():
     unet = model.model.diffusion_model
     
     # Freeze everything first
-    for param in model.parameters():
-        param.requires_grad = False
+    #for param in model.parameters():
+    #    param.requires_grad = False
 
     # 2. Inject Your Custom LoRA
     # ======================================================
@@ -80,9 +81,11 @@ def train():
     # from my_lora_implementation import inject_lora
     # inject_lora(unet, r=4) 
 
-    unet = loraModel(unet, rank=4, alpha=1, qkv=[True, True, True])
+    unet = loraModel(unet, rank=4, alpha=4, qkv=[True, True, True])
     unet.to(DEVICE)
     unet.set_trainable_parameters()
+
+    model.model.diffusion_model = unet
     
 
     # ensure only LoRA parameters have requires_grad=True
@@ -105,7 +108,8 @@ def train():
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 
     # 4. Training Loop
-    model.train()
+    unet.train()  # Instead of model.train()
+    model.eval() 
     
     for epoch in range(EPOCHS):
         pbar = tqdm(loader, desc=f"Epoch {epoch}")
@@ -133,10 +137,18 @@ def train():
             # E. Calculate Loss
             # The target depends on the prediction type (epsilon or v), but usually it's noise
             loss = F.mse_loss(model_output, noise)
-            
+
             # F. Backprop
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            grad_norms = [p.grad.norm().item() for p in trainable_params if p.grad is not None]
+            if len(grad_norms) > 0:
+                avg_grad = sum(grad_norms) / len(grad_norms)
+                pbar.set_postfix(loss=loss.item(), grad=f"{avg_grad:.4f}")
+            else:
+                print("WARNING: No gradients!")
+
             optimizer.step()
             
             pbar.set_postfix(loss=loss.item())
@@ -144,6 +156,8 @@ def train():
         # Save LoRA weights only
         # You'll need to write logic to save ONLY your lora layers, not the whole model
         torch.save(unet.state_dict(), os.path.join(OUTPUT_DIR, f"lora_epoch_{epoch}.pt"))
+    torch.save(unet.state_dict(), os.path.join(OUTPUT_DIR, f"lora_final.pt"))
+    print('Weights saved in ', OUTPUT_DIR+"/lora_final.pt")
 
 if __name__ == "__main__":
     train()

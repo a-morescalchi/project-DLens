@@ -98,14 +98,16 @@ class loraAttentionBlock(nn.Module):
 
     def forward(self, x):
         b, c, *spatial = x.shape
-        x = x.reshape(b, c, -1)
-        qkv = self.base.qkv(self.base.norm(x))
-        lora_qkv = torch.cat([self.lora_q(x), self.lora_k(x), self.lora_v(x)], dim=1)*self.scaling
-        h = self.base.attention(qkv + lora_qkv)
-        h = self.base.proj_out(h) + self.lora_proj_out(h)*self.scaling
-        desired_output = (x + h).reshape(b, c, *spatial)
-        return desired_output
+        x_flat = x.reshape(b, c, -1)
 
+        x_norm = self.base.norm(x_flat)
+        base_qkv = self.base.qkv(x_norm)
+
+        lora_qkv = torch.cat([self.lora_q(x_flat), self.lora_k(x_flat), self.lora_v(x_flat)], dim=1)*self.scaling
+        h = self.base.attention(base_qkv + lora_qkv)
+        h_final = self.base.proj_out(h) + self.lora_proj_out(h)*self.scaling
+        desired_output = (x_flat + h_final).reshape(b, c, *spatial)
+        return desired_output
 
 
 
@@ -396,11 +398,11 @@ def ignorant_lora(model, target_class=available_targets, rank=4, qkv=[True, Fals
     """
     Applies Lora wherever it can in the model
     """
-    for name, module in model.named_modules():
-        if isinstance(module, AttentionBlock):
-            print(f"mashallah")
+    #for name, module in model.named_modules():
+    #    if isinstance(module, AttentionBlock):
+    #        print(f"mashallah")
 
-    print([ name for name, module in model.named_modules() if any(isinstance(module, target) for target in target_class)])
+    #print([ name for name, module in model.named_modules() if any(isinstance(module, target) for target in target_class)])
     layers_to_replace = []
     for name, module in model.named_modules():
         for target in target_class: 
@@ -418,7 +420,7 @@ def ignorant_lora(model, target_class=available_targets, rank=4, qkv=[True, Fals
             child_name = full_name
             parent_module = model
 
-        print(f"Replacing layer: {full_name}")
+        #print(f"Replacing layer: {full_name}")
         new_layer = apply_lora_to_layer(old_layer, rank=rank, qkv=qkv, alpha=alpha)
         #print("New Parameters theoretical:", sum([len(n) for n, p in new_layer.named_parameters() if 'lora' in n]))
         setattr(parent_module, child_name, new_layer)
