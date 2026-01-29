@@ -7,6 +7,7 @@ from einops import rearrange, repeat
 import torch.nn as nn
 
 from ldm.modules.diffusionmodules.util import checkpoint
+from ldm.modules.diffusionmodules.openaimodel import AttentionBlock
 import copy
 
 
@@ -14,12 +15,11 @@ import copy
 class LowRankLinear(nn.Module):
     def __init__(self, in_features, out_features, rank):
         super().__init__()
-
         self.lora_down = nn.Linear(in_features, rank, bias=False)
         self.lora_up = nn.Linear(rank, out_features, bias=False)
         
-
-        nn.init.normal_(self.lora_down.weight, std=1/rank)
+        # FIX: Use Kaiming init for stability
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_up.weight)
 
         #print('Number of theoretical', len(self.lora_down.weight.flatten()) + len(self.lora_up.weight.flatten()))
@@ -49,6 +49,62 @@ class LowRankConv(nn.Module):
 
     def forward(self, x):
         return self.lora_B( self.lora_A( x ))
+    
+class LowRankConv1d(nn.Module):
+    def __init__(self, in_features, out_features, rank, zeros=False):
+        super().__init__()
+        self.zeros = zeros
+        if not zeros: 
+            self.lora_A = torch.nn.Conv1d(in_features,
+                             rank,
+                             kernel_size=1,
+                             stride=1,
+                             padding=0)
+            self.lora_B = torch.nn.Conv1d(rank,
+                             out_features,
+                             kernel_size=1,
+                             stride=1,
+                             padding=0)
+        
+            nn.init.normal_(self.lora_A.weight, std=1/rank)
+            nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x):
+        if self.zeros:
+            return torch.zeros_like(x)
+        return self.lora_B( self.lora_A( x ))
+
+
+class loraAttentionBlock(nn.Module):   
+    def __init__(self, base_layer, rank=4, qkv=[True, True, True], alpha=1, dropout=0):
+        super().__init__()
+        self.base = base_layer
+        self.rank = rank
+        self.qkv = qkv
+        self.scaling = alpha / rank
+
+
+        # Dimensions from the base layer
+        self.channels = base_layer.channels
+
+        # Initialize LoRA layers using LowRankConv (since input is image b,c,h,w)
+        
+        self.lora_q = LowRankConv1d(self.channels, self.channels, self.rank, zeros=not qkv[0])
+        self.lora_k = LowRankConv1d(self.channels, self.channels, self.rank, zeros=not qkv[1])
+        self.lora_v = LowRankConv1d(self.channels, self.channels, self.rank, zeros=not qkv[2])
+
+        self.lora_proj_out = LowRankConv1d(self.channels, self.channels, self.rank)
+
+
+    def forward(self, x):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.base.qkv(self.base.norm(x))
+        lora_qkv = torch.cat([self.lora_q(x), self.lora_k(x), self.lora_v(x)], dim=1)*self.scaling
+        h = self.base.attention(qkv + lora_qkv)
+        h = self.base.proj_out(h) + self.lora_proj_out(h)*self.scaling
+        desired_output = (x + h).reshape(b, c, *spatial)
+        return desired_output
 
 
 
@@ -313,28 +369,38 @@ class loraAttentionPool2d(nn.Module):
 
 
 
-def apply_lora_to_layer(layer, rank=4, qkv=[True, False, True]):
+def apply_lora_to_layer(layer, rank=4, alpha=1, qkv=[True, False, True]):
     '''
     applies vera to a layer if it can
     '''
     new_layer = copy.deepcopy(layer)
     if isinstance(layer, LinearAttention):
-        new_layer = loraLinearAttention(layer, rank=rank, qkv=qkv)
+        new_layer = loraLinearAttention(layer, rank=rank, qkv=qkv, alpha=alpha)
     elif isinstance(layer, SpatialSelfAttention):
-        new_layer = loraSpatialSelfAttention(layer, rank=rank, qkv=qkv)
+        new_layer = loraSpatialSelfAttention(layer, rank=rank, qkv=qkv, alpha=alpha)
     elif isinstance(layer, CrossAttention):
-        new_layer = loraCrossAttention(layer, rank=rank, qkv=qkv)
+        new_layer = loraCrossAttention(layer, rank=rank, qkv=qkv, alpha=alpha)
     elif isinstance(layer, AttentionPool2d):
         new_layer = loraAttentionPool2d(layer, rank=rank, qkv=qkv)
+    elif isinstance(layer, AttentionBlock):
+        new_layer = loraAttentionBlock(layer, rank=rank, qkv=qkv, alpha=alpha)
 
     return new_layer
-    
 
 
-def ignorant_lora(model, target_class):
+#removed LinearAttention because not ready I am tired voglio morire
+available_targets = [LinearAttention, SpatialSelfAttention, CrossAttention, AttentionPool2d , AttentionBlock]
+
+
+def ignorant_lora(model, target_class=available_targets, rank=4, qkv=[True, False, True], alpha=1):
     """
     Applies Lora wherever it can in the model
     """
+    for name, module in model.named_modules():
+        if isinstance(module, AttentionBlock):
+            print(f"mashallah")
+
+    print([ name for name, module in model.named_modules() if any(isinstance(module, target) for target in target_class)])
     layers_to_replace = []
     for name, module in model.named_modules():
         for target in target_class: 
@@ -353,14 +419,11 @@ def ignorant_lora(model, target_class):
             parent_module = model
 
         print(f"Replacing layer: {full_name}")
-        new_layer = apply_lora_to_layer(old_layer)
+        new_layer = apply_lora_to_layer(old_layer, rank=rank, qkv=qkv, alpha=alpha)
         #print("New Parameters theoretical:", sum([len(n) for n, p in new_layer.named_parameters() if 'lora' in n]))
         setattr(parent_module, child_name, new_layer)
     return model
 
-
-#removed LinearAttention because not ready I am tired voglio morire
-available_targets = [SpatialSelfAttention, CrossAttention, AttentionPool2d ]
 
 def print_trainable_parameters(model):
     trainable_params = 0
@@ -375,10 +438,10 @@ def print_trainable_parameters(model):
 
 
 class loraModel(nn.Module):
-    def __init__(self, base_model, rank = 4, qkv=[True, False, True], targets=available_targets):
+    def __init__(self, base_model, rank = 4, alpha=1, qkv=[True, False, True], targets=available_targets):
         super().__init__()
         
-        self.model = ignorant_lora(base_model, target_class=targets)
+        self.model = ignorant_lora(base_model, rank=rank, alpha=alpha, qkv=qkv, target_class=targets)
 
     def forward(self, x, t=None, **kwargs):
         return self.model(x, t, **kwargs)

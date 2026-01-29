@@ -1,189 +1,149 @@
-# ... (imports remain the same) ...
-from lora_train_dataset import LoRAParquetDataset 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
+from tqdm import tqdm
+import os
 
-# Repository imports
+# Imports from the latent-diffusion repo
 from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddpm import LatentDiffusion
 
-from lora import loraModel  # Assuming you have a module for LoRA application
+# Import our dataset
+from lora_train_dataset import LoRADataset
+from lora import loraModel
 
-import types
-from ldm.models.diffusion.ddpm import LatentDiffusion, DDPM
-import torch
+# --- Configuration ---
+CONFIG_PATH = "configs/latent-diffusion/celebahq-ldm-vq-4.yaml" # Check this path!
+CKPT_PATH = "celeba/model.ckpt" # Check this path!
+OUTPUT_DIR = "lora_checkpoints"
+BATCH_SIZE = 4
+LR = 1e-4
+EPOCHS = 100
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DATASET_URL = "hf://datasets/huggan/few-shot-obama/data/train-00000-of-00001.parquet"
 
-def custom_get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
-                     cond_key=None, return_original_cond=False, bs=None):
-    """
-    Patched get_input that:
-    1. Encodes images to latents (Fixes the 3 vs 4 channel error).
-    2. Handles text lists correctly (Fixes the list shape error).
-    """
-    # 1. Get the Raw Image (3 channels)
-    x = DDPM.get_input(self, batch, k)
-    
-    # 2. ENCODE TO LATENTS (Restored this step)
-    # We move x to the correct device first
-    x = x.to(self.device)
-    
-    # Run the VAE Encoder
-    encoder_posterior = self.encode_first_stage(x)
-    z = self.get_first_stage_encoding(encoder_posterior).detach()
-    
-    # 3. Get the Conditioning (Text)
-    if cond_key is None:
-        cond_key = self.cond_stage_key
-
-    if cond_key != self.first_stage_key:
-        if cond_key == "txt":
-            # Just grab the list, don't move to GPU
-            xc = batch[cond_key]
-        else:
-            xc = DDPM.get_input(self, batch, cond_key).to(self.device)
-    else:
-        xc = None
-
-    # 4. Encode the Conditioning (CLIP)
-    if not self.cond_stage_trainable or force_c_encode:
-        if isinstance(xc, (dict, list)):
-             # Handle list of strings -> CLIP Encoder
-             c = self.get_learned_conditioning(xc)
-        else:
-             c = self.get_learned_conditioning(xc.to(self.device))
-    else:
-        c = xc
-        
-    if bs is not None:
-        c = c[:bs]
-        z = z[:bs]
-
-    return z, c # Return latents (z), not pixels (x)
-
-# Apply the fixed patch
-LatentDiffusion.get_input = custom_get_input
-print("Global patch updated: Now encodes images to latents AND handles text lists.")
-
-
-    
-def enable_gradient_checkpointing(model):
-    """
-    Forcefully enables gradient checkpointing on all sub-modules 
-    that support it (ResBlocks, AttentionBlocks).
-    """
-    # 1. Enable on the top-level UNet (if it uses it)
-    if hasattr(model, "use_checkpoint"):
-        model.use_checkpoint = True
-
-    # 2. Iterate through all children to catch ResBlocks and AttentionBlocks
-    for name, module in model.named_modules():
-        # The CompVis repo uses 'use_checkpoint' in ResBlocks/AttentionBlocks
-        if hasattr(module, "use_checkpoint"):
-            module.use_checkpoint = True
-            
-        # Some older versions or specific blocks might use just 'checkpoint'
-        if hasattr(module, "checkpoint"):
-            module.checkpoint = True
-            
-    print("Gradient checkpointing enabled on all capable modules.")
-
-
-
-def train_lora_native(
-    config_path, 
-    ckpt_path, 
-    parquet_url="hf://datasets/huggan/few-shot-obama/data/train-00000-of-00001.parquet", 
-    batch_size=1, 
-    lr=1e-4, 
-    epochs=10
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 1. Load Config
+def load_model(config_path, ckpt_path):
+    # 1. Load the YAML configuration
     config = OmegaConf.load(config_path)
+    
+    # --- FIX START ---
+    # The config file points to a separate VQ-VAE file (models/first_stage_models/...)
+    # which you don't have. We delete this key so the code doesn't try to load it yet.
+    # The VAE weights will be loaded from your main 'ckpt_path' in step 3.
+    if "first_stage_config" in config.model.params:
+        if "ckpt_path" in config.model.params.first_stage_config.params:
+            print("Patched config: Removing reference to missing first_stage_model.")
+            del config.model.params.first_stage_config.params["ckpt_path"]
+    # --- FIX END ---
+
+    # 2. Instantiate the model (now with initialized, random VAE weights)
     model = instantiate_from_config(config.model)
     
-    # --- PATCH 1: Fix Get Input (Text Lists) ---
-    model.get_input = types.MethodType(custom_get_input, model)
-
-    # --- PATCH 2: Disable Lightning Logging (THE NEW FIX) ---
-    # Prevents "NoneType object has no attribute _results"
-    model.log_dict = lambda *args, **kwargs: None
-    model.log = lambda *args, **kwargs: None
-
-    # --- PATCH 3: Disable Internal Scheduler (THE NEW FIX) ---
-    # Prevents "NoneType object has no attribute lightning_optimizers"
-    model.use_scheduler = False
-
-    # --- PATCH 3: Fix CLIP Class Name ---
-    import ldm.modules.encoders.modules
-    ldm.modules.encoders.modules.FrozenCLIPEmbedder = ldm.modules.encoders.modules.FrozenCLIPTextEmbedder
-
-    # 2. Load Weights
+    # 3. Load the actual pre-trained weights (which contain both UNet and VAE)
     print(f"Loading weights from {ckpt_path}...")
-    pl_sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    sd = pl_sd["state_dict"] if "state_dict" in pl_sd else pl_sd
-    model.load_state_dict(sd, strict=False)
+    pl_sd = torch.load(ckpt_path, map_location="cpu")
+    if "state_dict" in pl_sd:
+        sd = pl_sd["state_dict"]
+    else:
+        sd = pl_sd
+        
+    # strict=False allows loading even if there are small mismatches
+    # (The main checkpoint keys will overwrite the random VAE weights)
+    m, u = model.load_state_dict(sd, strict=False)
+    
+    if len(m) > 0:
+        print(f"Missing keys: {len(m)}")
+    if len(u) > 0:
+        print(f"Unexpected keys: {len(u)}")
+        
+    model.to(DEVICE)
+    model.eval()
+    return model
 
-    # 3. Inject LoRA
-    print("Injecting LoRA adapters...")
-    model.model = loraModel(model.model, rank=4)
-    model.to(device)
+def train():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # 1. Load the Freeze the Base Model
+    model = load_model(CONFIG_PATH, CKPT_PATH)
+    
+    # In CompVis/latent-diffusion, the UNet is typically at model.model.diffusion_model
+    unet = model.model.diffusion_model
+    
+    # Freeze everything first
+    for param in model.parameters():
+        param.requires_grad = False
 
-    # --- PATCH 4: Move Schedule Tensors to GPU ---
-    schedule_vars = [
-        "logvar", "betas", "alphas_cumprod", "alphas_cumprod_prev", 
-        "sqrt_alphas_cumprod", "sqrt_one_minus_alphas_cumprod", 
-        "posterior_variance", "posterior_log_variance_clipped", 
-        "posterior_mean_coef1", "posterior_mean_coef2"
-    ]
-    for var_name in schedule_vars:
-        if hasattr(model, var_name):
-            attr = getattr(model, var_name)
-            if isinstance(attr, torch.Tensor):
-                setattr(model, var_name, attr.to(device))
-    
-    # 4. Freeze & Optimizer
-    model.first_stage_model.eval()
-    if model.cond_stage_model:
-        model.cond_stage_model.eval()
-    
-    enable_gradient_checkpointing(model.model)
-    model.requires_grad_(False)
-    model.model.set_trainable_parameters()
-    
-    trainable_params = [p for p in model.model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=lr)
-    
-    # 5. Dataset
-    dataset = LoRAParquetDataset(parquet_url, size=512)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # 2. Inject Your Custom LoRA
+    # ======================================================
+    # ??? INSERT YOUR LORA INJECTION HERE ???
+    # Example: 
+    # from my_lora_implementation import inject_lora
+    # inject_lora(unet, r=4) 
 
-    # 6. Training Loop
+    unet = loraModel(unet, rank=4, alpha=1, qkv=[True, True, True])
+    unet.to(DEVICE)
+    unet.set_trainable_parameters()
+    
+
+    # ensure only LoRA parameters have requires_grad=True
+    # ======================================================
+    
+    # Verify we have trainable parameters
+    trainable_params = [p for p in unet.parameters() if p.requires_grad]
+    print(f"Trainable parameters: {len(trainable_params)}")
+    if len(trainable_params) == 0:
+        print("WARNING: No trainable parameters found. Did you apply the LoRA?")
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=LR)
+
+    # 3. Dataset
+    dataset = LoRADataset(parquet_url=DATASET_URL, size=256)
+    
+    # Check if dataset loaded correctly
+    print(f"Dataset loaded: {len(dataset)} images found.")
+    
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+
+    # 4. Training Loop
     model.train()
-    print("Starting Training Loop...")
     
-    for epoch in range(epochs):
-        for step, batch in enumerate(dataloader):
-            # Move tensors to GPU
-            for k in batch:
-                if isinstance(batch[k], torch.Tensor):
-                    batch[k] = batch[k].to(device)
-
-            with torch.cuda.amp.autocast():
-                # OLD: loss, loss_dict = model.training_step(batch, batch_idx=step)
-                
-                # NEW: Call shared_step directly. 
-                # It returns (loss, dict) and skips the Lightning overhead.
-                loss, loss_dict = model.shared_step(batch)
-
+    for epoch in range(EPOCHS):
+        pbar = tqdm(loader, desc=f"Epoch {epoch}")
+        for x in pbar:
+            x = x.to(DEVICE)
+            
+            # A. Encode Images to Latent Space
+            # The model handles the VQGAN encoding internally via encode_first_stage
+            with torch.no_grad():
+                z = model.get_first_stage_encoding(model.encode_first_stage(x))
+            
+            # B. Sample Noise & Timesteps
+            t = torch.randint(0, model.num_timesteps, (x.shape[0],), device=DEVICE).long()
+            noise = torch.randn_like(z)
+            
+            # C. Add Noise (Forward Diffusion)
+            # q_sample is the method in LDM to add noise at step t
+            x_noisy = model.q_sample(x_start=z, t=t, noise=noise)
+            
+            # D. Predict Noise
+            # apply_model runs the UNet
+            # Note: LDM CelebA is unconditional, so second argument (context) is usually None
+            model_output = model.apply_model(x_noisy, t, cond=None)
+            
+            # E. Calculate Loss
+            # The target depends on the prediction type (epsilon or v), but usually it's noise
+            loss = F.mse_loss(model_output, noise)
+            
+            # F. Backprop
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
+            pbar.set_postfix(loss=loss.item())
 
-            if step % 10 == 0:
-                print(f"Epoch {epoch}, Step {step}, Loss: {loss.item():.4f}")
+        # Save LoRA weights only
+        # You'll need to write logic to save ONLY your lora layers, not the whole model
+        torch.save(unet.state_dict(), os.path.join(OUTPUT_DIR, f"lora_epoch_{epoch}.pt"))
 
-    torch.save(model.model.state_dict(), "lora_finetuned.pt")
-    print("Training complete. Saved to lora_finetuned.pt")
+if __name__ == "__main__":
+    train()

@@ -5,7 +5,7 @@ venv
 latent-diffusion*
 lora_old*
 deepfake*
-
+celeba
 
 #wip files
 vera.py 
