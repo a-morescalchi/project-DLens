@@ -81,11 +81,14 @@ def train(BATCH_SIZE = 4, LR = 1e-4, EPOCHS = 100):
     # from my_lora_implementation import inject_lora
     # inject_lora(unet, r=4) 
 
-    unet = loraModel(unet, rank=4, alpha=4, qkv=[True, True, True])
+    unet = loraModel(unet, rank=16, alpha=16, qkv=[True, True, True])
     unet.to(DEVICE)
     unet.set_trainable_parameters()
 
     model.model.diffusion_model = unet
+    print("Checking if LoRA is in the computation graph...")
+    print(f"model.model.diffusion_model type: {type(model.model.diffusion_model)}")
+    print(f"Is it loraModel? {isinstance(model.model.diffusion_model, loraModel)}")
     
 
     # ensure only LoRA parameters have requires_grad=True
@@ -97,7 +100,11 @@ def train(BATCH_SIZE = 4, LR = 1e-4, EPOCHS = 100):
     if len(trainable_params) == 0:
         print("WARNING: No trainable parameters found. Did you apply the LoRA?")
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=LR)
+    optimizer = torch.optim.AdamW(trainable_params, lr=LR, weight_decay=1e-2)
+    initial_weights = {}
+    for name, param in unet.named_parameters():
+        if 'lora' in name and param.requires_grad:
+            initial_weights[name] = param.data.clone()
 
     # 3. Dataset
     dataset = LoRADataset(parquet_url=DATASET_URL, size=256)
@@ -156,6 +163,17 @@ def train(BATCH_SIZE = 4, LR = 1e-4, EPOCHS = 100):
         # Save LoRA weights only
         # You'll need to write logic to save ONLY your lora layers, not the whole model
         torch.save(unet.state_dict(), os.path.join(OUTPUT_DIR, f"lora_epoch_{epoch}.pt"))
+        if epoch % 10 == 0:
+            weight_changes = []
+            for name, param in unet.named_parameters():
+                if 'lora' in name and param.requires_grad:
+                    change = (param.data - initial_weights[name]).abs().mean().item()
+                    weight_changes.append(change)
+            avg_change = sum(weight_changes) / len(weight_changes) if weight_changes else 0
+            print(f"Epoch {epoch}: Average LoRA weight change: {avg_change:.6f}")
+            
+    avg_change = sum(weight_changes) / len(weight_changes) if weight_changes else 0
+    print(f"Epoch {epoch}: Average LoRA weight change: {avg_change:.6f}")
     torch.save(unet.state_dict(), os.path.join(OUTPUT_DIR, f"lora_final.pt"))
     print('Weights saved in ', OUTPUT_DIR+"/lora_final.pt")
 

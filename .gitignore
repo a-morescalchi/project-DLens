@@ -2,8 +2,11 @@
 venv
 
 #l'altra repo
-latent-diffusion*
+*.ckpt
+*.pt
+
 lora_old*
+lora_cring_long*
 deepfake*
 celeba
 
